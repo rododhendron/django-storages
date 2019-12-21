@@ -4,9 +4,11 @@ import mimetypes
 from datetime import datetime, timedelta
 from tempfile import SpooledTemporaryFile
 
-from azure.common import AzureMissingResourceHttpError
-from azure.storage.blob import BlobPermissions, ContentSettings
-from azure.storage.blob.blockblobservice import BlockBlobService
+from azure.core.exceptions import ResourceNotFoundError
+from azure.storage.blob import (
+    BlobClient, BlobSasPermissions, ContainerClient, ContentSettings,
+    generate_blob_sas,
+)
 from django.core.exceptions import SuspiciousOperation
 from django.core.files.base import File
 from django.core.files.storage import Storage
@@ -42,12 +44,9 @@ class AzureStorageFile(File):
         if 'r' in self._mode or 'a' in self._mode:
             # I set max connection to 1 since spooledtempfile is
             # not seekable which is required if we use max_connections > 1
-            self._storage.service.get_blob_to_stream(
-                container_name=self._storage.azure_container,
-                blob_name=self._path,
-                stream=file,
-                max_connections=1,
-                timeout=self._storage.timeout)
+            download_stream = self._storage.client.download_blob(
+                self._path, timeout=self._storage.timeout)
+            download_stream.download_to_stream(file, max_concurrency=1)
         if 'r' in self._mode:
             file.seek(0)
 
@@ -135,52 +134,44 @@ class AzureStorage(Storage):
     location = setting('AZURE_LOCATION', '')
     default_content_type = 'application/octet-stream'
     cache_control = setting("AZURE_CACHE_CONTROL")
-    is_emulated = setting('AZURE_EMULATED_MODE', False)
     endpoint_suffix = setting('AZURE_ENDPOINT_SUFFIX')
     sas_token = setting('AZURE_SAS_TOKEN')
     custom_domain = setting('AZURE_CUSTOM_DOMAIN')
     connection_string = setting('AZURE_CONNECTION_STRING')
-    custom_connection_string = setting(
-        'AZURE_CUSTOM_CONNECTION_STRING', setting('AZURE_CONNECTION_STRING'))
     token_credential = setting('AZURE_TOKEN_CREDENTIAL')
 
     def __init__(self):
-        self._service = None
-        self._custom_service = None
+        self._client = None
 
-    def _blob_service(self, custom_domain=None, connection_string=None):
-        # This won't open a connection or anything,
-        # it's akin to a client
-        return BlockBlobService(
-            account_name=self.account_name,
-            account_key=self.account_key,
-            sas_token=self.sas_token,
-            is_emulated=self.is_emulated,
-            protocol=self.azure_protocol,
-            custom_domain=custom_domain,
-            connection_string=connection_string,
-            token_credential=self.token_credential,
-            endpoint_suffix=self.endpoint_suffix)
-
-    @property
-    def service(self):
-        if self._service is None:
-            custom_domain = None
-            if self.is_emulated:
-                custom_domain = self.custom_domain
-            self._service = self._blob_service(
-                custom_domain=custom_domain,
-                connection_string=self.connection_string)
-        return self._service
+    def _container_client(self, custom_domain=None, connection_string=None):
+        if custom_domain is None:
+            account_domain = "blob." + (self.endpoint_suffix or "core.windows.net")
+        else:
+            account_domain = custom_domain
+        if connection_string is None:
+            connection_string = "{}://{}.{}".format(
+                self.azure_protocol,
+                self.account_name,
+                account_domain)
+        credential = None
+        if self.account_key:
+            credential = self.account_key
+        elif self.sas_token:
+            credential = self.sas_token
+        elif self.token_credential:
+            credential = self.token_credential
+        return ContainerClient(
+            connection_string,
+            self.azure_container,
+            credential=credential)
 
     @property
-    def custom_service(self):
-        """This is used to generate the URL"""
-        if self._custom_service is None:
-            self._custom_service = self._blob_service(
+    def client(self):
+        if self._client is None:
+            self._client = self._container_client(
                 custom_domain=self.custom_domain,
-                connection_string=self.custom_connection_string)
-        return self._custom_service
+                connection_string=self.connection_string)
+        return self._client
 
     @property
     def azure_protocol(self):
@@ -215,26 +206,25 @@ class AzureStorage(Storage):
         return super(AzureStorage, self).get_available_name(name, max_length)
 
     def exists(self, name):
-        return self.service.exists(
-            self.azure_container,
-            self._get_valid_path(name),
-            timeout=self.timeout)
+        blob_client = self.client.get_blob_client(self._get_valid_path(name))
+        try:
+            blob_client.get_blob_properties()
+            return True
+        except ResourceNotFoundError:
+            return False
 
     def delete(self, name):
         try:
-            self.service.delete_blob(
-                container_name=self.azure_container,
-                blob_name=self._get_valid_path(name),
+            self.client.delete_blob(
+                self._get_valid_path(name),
                 timeout=self.timeout)
-        except AzureMissingResourceHttpError:
+        except ResourceNotFoundError:
             pass
 
     def size(self, name):
-        properties = self.service.get_blob_properties(
-            self.azure_container,
-            self._get_valid_path(name),
-            timeout=self.timeout).properties
-        return properties.content_length
+        blob_client = self.client.get_blob_client(self._get_valid_path(name))
+        properties = blob_client.get_blob_properties(timeout=self.timeout)
+        return properties.size
 
     def _save(self, name, content):
         cleaned_name = clean_name(name)
@@ -250,16 +240,16 @@ class AzureStorage(Storage):
             content = content.file
 
         content.seek(0)
-        self.service.create_blob_from_stream(
-            container_name=self.azure_container,
-            blob_name=name,
-            stream=content,
+        self.client.upload_blob(
+            name,
+            content,
             content_settings=ContentSettings(
                 content_type=content_type,
                 content_encoding=content_encoding,
                 cache_control=self.cache_control),
-            max_connections=self.upload_max_conn,
-            timeout=self.timeout)
+            max_concurrency=self.upload_max_conn,
+            timeout=self.timeout,
+            overwrite=self.overwrite_files)
         return cleaned_name
 
     def _expire_at(self, expire):
@@ -272,27 +262,29 @@ class AzureStorage(Storage):
         if expire is None:
             expire = self.expiration_secs
 
-        make_blob_url_kwargs = {}
+        credential = None
         if expire:
-            sas_token = self.custom_service.generate_blob_shared_access_signature(
-                self.azure_container, name, permission=BlobPermissions.READ, expiry=self._expire_at(expire))
-            make_blob_url_kwargs['sas_token'] = sas_token
+            sas_token = generate_blob_sas(
+                self.account_name,
+                self.azure_container,
+                name,
+                account_key=self.account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=self._expire_at(expire))
+            credential = sas_token
 
-        return self.custom_service.make_blob_url(
-            container_name=self.azure_container,
-            blob_name=filepath_to_uri(name),
-            protocol=self.azure_protocol,
-            **make_blob_url_kwargs)
+        container_blob_url = self.client.get_blob_client(
+            filepath_to_uri(name)).url
+        return BlobClient.from_blob_url(container_blob_url, credential=credential).url
 
     def get_modified_time(self, name):
         """
         Returns an (aware) datetime object containing the last modified time if
         USE_TZ is True, otherwise returns a naive datetime in the local timezone.
         """
-        properties = self.service.get_blob_properties(
-            self.azure_container,
+        properties = self.client.get_blob_properties(
             self._get_valid_path(name),
-            timeout=self.timeout).properties
+            timeout=self.timeout)
         if not setting('USE_TZ', False):
             return timezone.make_naive(properties.last_modified)
 
@@ -320,9 +312,8 @@ class AzureStorage(Storage):
         # XXX make generator, add start, end
         return [
             blob.name
-            for blob in self.service.list_blobs(
-                self.azure_container,
-                prefix=path,
+            for blob in self.client.list_blobs(
+                name_starts_with=path,
                 timeout=self.timeout)]
 
     def listdir(self, path=''):

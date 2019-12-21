@@ -19,12 +19,11 @@ class AzureStorageTest(TestCase):
 
     def setUp(self, *args):
         self.storage = azure_storage.AzureStorage()
-        self.storage.is_emulated = True
         self.storage.account_name = "XXX"
         self.storage.account_key = "KXXX"
         self.storage.azure_container = "test"
-        self.storage.service.delete_container(
-            self.storage.azure_container, fail_not_exist=False)
+        self.storage.client.delete_container(
+            fail_not_exist=False)
         self.storage.service.create_container(
             self.storage.azure_container, public_access=False, fail_on_exist=False)
 
@@ -75,7 +74,6 @@ class AzureStorageTest(TestCase):
 
     def test_url_custom_endpoint(self):
         storage = azure_storage.AzureStorage()
-        storage.is_emulated = True
         storage.custom_domain = 'foobar:123456'
         self.assertTrue(storage.url("my_file.txt").startswith('https://foobar:123456/'))
 
@@ -114,12 +112,8 @@ class AzureStorageTest(TestCase):
             fh.close()
 
         stream = io.BytesIO()
-        self.storage.service.get_blob_to_stream(
-            container_name=self.storage.azure_container,
-            blob_name='root/path/some file.txt',
-            stream=stream,
-            max_connections=1,
-            timeout=10)
+        download_stream = self.storage.client.download_blob('root/path/some file.txt', timeout=10)
+        download_stream.download_to_stream(stream, max_concurrency=1)
         stream.seek(0)
         self.assertEqual(stream.read(), b'Im a stream')
 
@@ -134,12 +128,8 @@ class AzureStorageTest(TestCase):
             fh.close()
 
         stream = io.BytesIO()
-        self.storage.service.get_blob_to_stream(
-            container_name=self.storage.azure_container,
-            blob_name=path,
-            stream=stream,
-            max_connections=1,
-            timeout=10)
+        download_stream = self.storage.client.download_blob(path, timeout=10)
+        download_stream.download_to_stream(stream, max_concurrency=1)
         stream.seek(0)
         self.assertEqual(stream.read(), b'foo')
 
@@ -152,12 +142,8 @@ class AzureStorageTest(TestCase):
             fh.close()
 
         stream = io.BytesIO()
-        self.storage.service.get_blob_to_stream(
-            container_name=self.storage.azure_container,
-            blob_name=path,
-            stream=stream,
-            max_connections=1,
-            timeout=10)
+        download_stream = self.storage.client.download_blob(path, timeout=10)
+        download_stream.download_to_stream(stream, max_concurrency=1)
         stream.seek(0)
         self.assertEqual(stream.read(), b'bar')
 
@@ -175,12 +161,8 @@ class AzureStorageTest(TestCase):
             fh.close()
 
         stream = io.BytesIO()
-        self.storage.service.get_blob_to_stream(
-            container_name=self.storage.azure_container,
-            blob_name='root/file.txt',
-            stream=stream,
-            max_connections=1,
-            timeout=10)
+        download_stream = self.storage.client.download_blob('root/file.txt', timeout=10)
+        download_stream.download_to_stream(stream, max_concurrency=1)
         stream.seek(0)
         self.assertEqual(stream.read(), b'Im a stream foo')
 
@@ -215,10 +197,8 @@ class FooFileModelForm(forms.ModelForm):
 class AzureStorageDjangoTest(TestCase):
 
     def setUp(self, *args):
-        default_storage.service.delete_container(
-            default_storage.azure_container, fail_not_exist=False)
-        default_storage.service.create_container(
-            default_storage.azure_container, public_access=False, fail_on_exist=False)
+        default_storage.service.delete_container()
+        default_storage.service.create_container()
 
     def test_is_azure(self):
         self.assertIsInstance(default_storage, azure_storage.AzureStorage)
